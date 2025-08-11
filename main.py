@@ -1,6 +1,7 @@
 # main.py
 import asyncio
 import os
+import logging
 from typing import Dict, List, Set
 
 from aiogram import Bot, Dispatcher, F, types
@@ -11,6 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from flyerapi import Flyer
 
+logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -49,30 +51,38 @@ def build_tasks_kb(tasks: List[dict], stage: int) -> InlineKeyboardBuilder:
 async def fetch_unique_tasks(user_id: int, language_code: str, exclude: Set[str], limit: int) -> List[dict]:
     """
     Возвращает до `limit` задач, подписи которых (signature) отсутствуют в exclude.
-    Защита от сбоев/нестандартных ответов Flyer: не падаем на исключениях.
+    Защищено от сбоев Flyer: не падаем на исключениях, пробуем несколько языков.
     """
     unique: List[dict] = []
     seen = set(exclude)
 
-    for _ in range(5):  # несколько попыток набрать уникальные задачи
-        tasks: List[dict] = []
-        try:
-            resp = await flyer.get_tasks(user_id=user_id, language_code=language_code, limit=limit + 5)
-            tasks = resp if isinstance(resp, list) else []
-        except Exception as e:
-            print(f"[flyer.get_tasks] error: {repr(e)}")
-            tasks = []
+    # Порядок попыток: язык пользователя -> ru -> en -> без языкового фильтра
+    attempts = []
+    if language_code:
+        attempts.append(language_code)
+    attempts += ["ru", "en", None]
 
-        for t in tasks:
-            sig = t.get("signature")
-            if not sig or sig in seen:
-                continue
-            unique.append(t)
-            seen.add(sig)
-            if len(unique) >= limit:
-                return unique
+    for lang in attempts:
+        for _ in range(3):
+            try:
+                kwargs = {"user_id": user_id, "limit": limit + 5}
+                if lang is not None:
+                    kwargs["language_code"] = lang
+                resp = await flyer.get_tasks(**kwargs)
+                tasks = resp if isinstance(resp, list) else []
+            except Exception as e:
+                logging.warning(f"[flyer.get_tasks lang={lang}] {e!r}")
+                tasks = []
 
-        await asyncio.sleep(0.2)
+            for t in tasks:
+                sig = t.get("signature")
+                if not sig or sig in seen:
+                    continue
+                unique.append(t)
+                seen.add(sig)
+                if len(unique) >= limit:
+                    return unique
+            await asyncio.sleep(0.2)
 
     return unique
 
@@ -87,7 +97,7 @@ async def start_flow(message: types.Message):
         await message.answer("Пока нет доступных заданий. Попробуй позже.")
         return
 
-    sigs = {t["signature"] for t in tasks if t.get("signature")}
+    sigs = {t.get("signature") for t in tasks if t.get("signature")}
     STATE[user_id]["batch_signatures"] = sigs
     STATE[user_id]["known_signatures"] = set(sigs)
 
@@ -105,6 +115,22 @@ async def on_start(message: types.Message):
     await start_flow(message)
 
 
+async def edit_or_send(call: types.CallbackQuery | types.Message, text: str, markup=None):
+    """
+    Всегда отправляем НОВОЕ сообщение (не редактируем),
+    чтобы не ловить 'Prohibited method for a bot type'.
+    """
+    if isinstance(call, types.CallbackQuery):
+        try:
+            await call.answer()
+        except Exception:
+            pass
+        chat_id = call.message.chat.id
+    else:
+        chat_id = call.chat.id
+    await bot.send_message(chat_id, text, reply_markup=markup)
+
+
 @dp.callback_query(F.data.startswith("verify:"))
 async def on_verify(call: types.CallbackQuery):
     user_id = call.from_user.id
@@ -112,8 +138,7 @@ async def on_verify(call: types.CallbackQuery):
     st = STATE.get(user_id)
 
     if not st:
-        await call.message.edit_text("Сессия не найдена, начни заново: /start")
-        await call.answer()
+        await edit_or_send(call, "Сессия не найдена, начни заново: /start")
         return
 
     stage = int(call.data.split(":", 1)[1])
@@ -123,8 +148,7 @@ async def on_verify(call: types.CallbackQuery):
 
     batch = list(st["batch_signatures"])
     if not batch:
-        await call.message.edit_text("Нет активных заданий. Попробуй /start")
-        await call.answer()
+        await edit_or_send(call, "Нет активных заданий. Попробуй /start")
         return
 
     ok = 0
@@ -133,24 +157,20 @@ async def on_verify(call: types.CallbackQuery):
             if await flyer.check_task(user_id=user_id, signature=sig):
                 ok += 1
         except Exception as e:
-            print(f"[flyer.check_task] error for {sig}: {repr(e)}")
+            logging.warning(f"[flyer.check_task] {sig}: {e!r}")
 
     if ok < len(batch):
-        await call.answer()
-        await call.message.edit_text(
-            f"Выполнено {ok}/{len(batch)}. Подпишись на все и нажми «Проверить выполнение».",
-            reply_markup=call.message.reply_markup
-        )
+        await edit_or_send(call, f"Выполнено {ok}/{len(batch)}. Подпишись на все и нажми «Проверить выполнение».",
+                           call.message.reply_markup)
         return
 
     if stage == 1:
         st["stage"] = 2
         tasks2 = await fetch_unique_tasks(user_id, lang, st["known_signatures"], BATCH_SIZE)
-        sigs2 = {t["signature"] for t in tasks2 if t.get("signature")}
+        sigs2 = {t.get("signature") for t in tasks2 if t.get("signature")}
         # гарантия, что 2-я пачка не пересекается с 1-й
         if (len(tasks2) < BATCH_SIZE) or (sigs2 & st["known_signatures"]):
-            await call.message.edit_text("Вторая пачка заданий недоступна. Попробуй позже /start")
-            await call.answer()
+            await edit_or_send(call, "Вторая пачка заданий недоступна. Попробуй позже /start")
             return
         st["batch_signatures"] = sigs2
         st["known_signatures"].update(sigs2)
@@ -158,25 +178,21 @@ async def on_verify(call: types.CallbackQuery):
             "<b>Отлично!</b> Первая пачка готова.\n"
             f"Теперь подпишись ещё на {BATCH_SIZE} каналов и нажми «Проверить выполнение»."
         )
-        await call.message.edit_text(text, reply_markup=build_tasks_kb(tasks2, stage=2).as_markup())
+        await edit_or_send(call, text, build_tasks_kb(tasks2, stage=2).as_markup())
     else:
-        await call.message.edit_text(
-            "<b>Готово!</b> Ты выполнил все задания.\n"
-            f"Твоя ссылка на бота: {TARGET_BOT_URL}"
-        )
+        await edit_or_send(call, "<b>Готово!</b> Ты выполнил все задания.\n" f"Твоя ссылка на бота: {TARGET_BOT_URL}")
         STATE.pop(user_id, None)
-    await call.answer()
 
 
 async def main():
-    # 1) убираем вебхук, иначе будет конфликт с long polling
+    # убрать webhook, чтобы не конфликтовал с long polling
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # 2) проверяем токен — в логах увидишь имя бота
+    # проверить токен — в логах увидишь имя бота
     me = await bot.get_me()
-    print(f"OK: logged in as @{me.username} (id={me.id})")
+    logging.info(f"OK: logged in as @{me.username} (id={me.id})")
 
-    # 3) стартуем long polling
+    # запустить long polling
     await dp.start_polling(bot)
 
 
