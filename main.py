@@ -25,7 +25,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 flyer = Flyer(FLYER_KEY)
 
-# Память: user_id -> {stage, known_signatures, batch_signatures}
+# простое состояние в памяти: user_id -> {stage, known_signatures, batch_signatures}
 STATE: Dict[int, Dict] = {}
 
 
@@ -47,14 +47,28 @@ def build_tasks_kb(tasks: List[dict], stage: int) -> InlineKeyboardBuilder:
 
 
 async def fetch_unique_tasks(user_id: int, language_code: str, exclude: Set[str], limit: int) -> List[dict]:
-    """Вернуть до `limit` задач, подписи которых (signature) отсутствуют в exclude."""
+    """
+    Возвращает до `limit` задач, подписи которых (signature) отсутствуют в exclude.
+    Защищаемся от сбоев/нестандартных ответов Flyer.
+    """
     unique: List[dict] = []
     seen = set(exclude)
-    for _ in range(4):  # несколько попыток, если сразу мало задач
+
+    for _ in range(5):  # несколько попыток набрать уникальные задачи
+        tasks: List[dict] = []
         try:
-            tasks = await flyer.get_tasks(user_id=user_id, language_code=language_code, limit=limit + 5)
-        except Exception:
+            raw = await flyer.get_tasks(user_id=user_id, language_code=language_code, limit=limit + 5)
+            if isinstance(raw, list):
+                tasks = raw
+            else:
+                # если библиотека вернула не список (или словарь-ошибку) — трактуем как отсутствие задач
+                tasks = []
+        except Exception as e:
+            # сюда попадёт и KeyError внутри flyerapi, и сетевые ошибки
+            print(f"[flyer.get_tasks] error: {repr(e)}")
+            await asyncio.sleep(0.5)
             tasks = []
+
         for t in tasks:
             sig = t.get("signature")
             if not sig or sig in seen:
@@ -63,37 +77,12 @@ async def fetch_unique_tasks(user_id: int, language_code: str, exclude: Set[str]
             seen.add(sig)
             if len(unique) >= limit:
                 return unique
+
+        await asyncio.sleep(0.2)
+
     return unique
 
 
 async def start_flow(message: types.Message):
     user_id = message.from_user.id
-    lang = (message.from_user.language_code or "ru")
-    STATE[user_id] = {"stage": 1, "known_signatures": set(), "batch_signatures": set()}
-
-    tasks = await fetch_unique_tasks(user_id, lang, set(), BATCH_SIZE)
-    if len(tasks) < BATCH_SIZE:
-        await message.answer("Пока нет доступных заданий. Попробуй позже.")
-        return
-
-    sigs = {t["signature"] for t in tasks if t.get("signature")}
-    STATE[user_id]["batch_signatures"] = sigs
-    STATE[user_id]["known_signatures"] = set(sigs)
-
-    text = (
-        "<b>Доступ к функционалу</b>\n\n"
-        f"1) Подпишись на {BATCH_SIZE} каналов ниже\n"
-        "2) Нажми «Проверить выполнение»\n"
-        "После этого я попрошу подписаться ещё на такую же пачку — и открою доступ."
-    )
-    await message.answer(text, reply_markup=build_tasks_kb(tasks, stage=1).as_markup())
-
-
-@dp.message(CommandStart())
-async def on_start(message: types.Message):
-    await start_flow(message)
-
-
-@dp.callback_query(F.data.startswith("verify:"))
-async def on_verify(call: types.CallbackQuery):
-    user_id = call.from_user.
+    lang = (message.from_user.language_
