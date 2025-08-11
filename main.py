@@ -25,7 +25,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 flyer = Flyer(FLYER_KEY)
 
-# состояние в памяти: user_id -> {stage, known_signatures, batch_signatures}
+# простое состояние в памяти: user_id -> {stage, known_signatures, batch_signatures}
 STATE: Dict[int, Dict] = {}
 
 
@@ -47,16 +47,22 @@ def build_tasks_kb(tasks: List[dict], stage: int) -> InlineKeyboardBuilder:
 
 
 async def fetch_unique_tasks(user_id: int, language_code: str, exclude: Set[str], limit: int) -> List[dict]:
-    """Вернуть до `limit` задач, подписи которых нет в exclude. Не падаем на ошибках API."""
+    """
+    Возвращает до `limit` задач, подписи которых (signature) отсутствуют в exclude.
+    Защита от сбоев/нестандартных ответов Flyer: не падаем на исключениях.
+    """
     unique: List[dict] = []
     seen = set(exclude)
-    for _ in range(5):
+
+    for _ in range(5):  # несколько попыток набрать уникальные задачи
+        tasks: List[dict] = []
         try:
             resp = await flyer.get_tasks(user_id=user_id, language_code=language_code, limit=limit + 5)
             tasks = resp if isinstance(resp, list) else []
         except Exception as e:
-            print(f"[flyer.get_tasks] error: {e!r}")
+            print(f"[flyer.get_tasks] error: {repr(e)}")
             tasks = []
+
         for t in tasks:
             sig = t.get("signature")
             if not sig or sig in seen:
@@ -65,7 +71,9 @@ async def fetch_unique_tasks(user_id: int, language_code: str, exclude: Set[str]
             seen.add(sig)
             if len(unique) >= limit:
                 return unique
+
         await asyncio.sleep(0.2)
+
     return unique
 
 
@@ -125,7 +133,7 @@ async def on_verify(call: types.CallbackQuery):
             if await flyer.check_task(user_id=user_id, signature=sig):
                 ok += 1
         except Exception as e:
-            print(f"[flyer.check_task] error for {sig}: {e!r}")
+            print(f"[flyer.check_task] error for {sig}: {repr(e)}")
 
     if ok < len(batch):
         await call.answer()
@@ -139,6 +147,7 @@ async def on_verify(call: types.CallbackQuery):
         st["stage"] = 2
         tasks2 = await fetch_unique_tasks(user_id, lang, st["known_signatures"], BATCH_SIZE)
         sigs2 = {t["signature"] for t in tasks2 if t.get("signature")}
+        # гарантия, что 2-я пачка не пересекается с 1-й
         if (len(tasks2) < BATCH_SIZE) or (sigs2 & st["known_signatures"]):
             await call.message.edit_text("Вторая пачка заданий недоступна. Попробуй позже /start")
             await call.answer()
@@ -155,4 +164,21 @@ async def on_verify(call: types.CallbackQuery):
             "<b>Готово!</b> Ты выполнил все задания.\n"
             f"Твоя ссылка на бота: {TARGET_BOT_URL}"
         )
-        STATE.pop(user_id, N_
+        STATE.pop(user_id, None)
+    await call.answer()
+
+
+async def main():
+    # 1) убираем вебхук, иначе будет конфликт с long polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # 2) проверяем токен — в логах увидишь имя бота
+    me = await bot.get_me()
+    print(f"OK: logged in as @{me.username} (id={me.id})")
+
+    # 3) стартуем long polling
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
