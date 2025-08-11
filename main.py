@@ -151,6 +151,7 @@ async def on_verify(call: types.CallbackQuery):
     await call.answer()
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)  
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
