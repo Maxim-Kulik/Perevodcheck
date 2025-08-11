@@ -22,13 +22,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
--from aiogram import Bot, Dispatcher, F, types
-+from aiogram import Bot, Dispatcher, F, types
-+from aiogram.client.default import DefaultBotProperties
-+from aiogram.enums import ParseMode
-...
--bot = Bot(BOT_TOKEN, parse_mode="HTML")
-+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
 dp = Dispatcher()
 flyer = Flyer(FLYER_KEY)
 
